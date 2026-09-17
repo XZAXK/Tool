@@ -3,9 +3,9 @@ from datetime import datetime
 from pathlib import Path
 
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QKeySequence, QPixmap
+from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-                            QListWidget, QSplitter, QSlider, QSpinBox, QCheckBox,
+                            QListWidget, QSplitter, QSpinBox, QCheckBox,
                             QComboBox, QFileDialog, QShortcut)
 
 from .demo import generate_sample
@@ -13,7 +13,7 @@ from .exports import export_images
 from .frame_store import fingerprint
 from .media import FrameReader, inspect_video
 from .rendering import to_image
-from .widgets import ImageView, button, VIDEOS
+from .widgets import ImageView, TimelineSlider, button, VIDEOS
 
 
 class FramePage(QWidget):
@@ -27,6 +27,8 @@ class FramePage(QWidget):
         self.frame_ready = False
         self.reader = None
         self.reader_path = None
+        self.pending_frame = None
+        self.window.job_idle.connect(self.flush_pending_frame)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.advance)
         layout = QVBoxLayout(self)
@@ -53,9 +55,9 @@ class FramePage(QWidget):
         middle.addWidget(self.view, 1)
         self.frame_label = QLabel('导入视频后，标记需要保存为图片的帧。')
         middle.addWidget(self.frame_label)
-        self.slider = QSlider(Qt.Horizontal)
-        self.slider.setTracking(False)
-        self.slider.valueChanged.connect(self.request_frame)
+        self.slider = TimelineSlider()
+        self.slider.scrubStarted.connect(self.pause)
+        self.slider.seekRequested.connect(self.seek)
         self.slider.setEnabled(False)
         middle.addWidget(self.slider)
         nav = QHBoxLayout()
@@ -72,7 +74,7 @@ class FramePage(QWidget):
         nav.addWidget(QLabel('跳转帧（从 0 开始）'))
         self.jump = QSpinBox()
         nav.addWidget(self.jump)
-        button('跳转', nav, lambda: self.request_frame(self.jump.value()))
+        button('跳转', nav, lambda: self.seek(self.jump.value()))
         middle.addLayout(nav)
         splitter.addWidget(center)
         self.panel = QWidget()
@@ -187,8 +189,10 @@ class FramePage(QWidget):
             return
         self.pause()
         self.current = self.tasks[row]
-        self.view.item.setPixmap(QPixmap())
-        self.view.manual = False
+        self.pending_frame = None
+        self.frame_ready = False
+        self.panel.setEnabled(False)
+        self.view.clear_image()
         self.frame_label.setText('正在载入当前视频…')
         self.slider.setEnabled(False)
         info = self.current['info']
@@ -196,14 +200,34 @@ class FramePage(QWidget):
         self.slider.blockSignals(True)
         self.slider.setRange(0, info.frame_count-1)
         self.slider.blockSignals(False)
+        self.update_marks()
         self.request_frame(min(self.store.position(self.current['key']), info.frame_count-1))
 
+    def seek(self, index):
+        self.pause()
+        self.request_frame(index)
+
+    def flush_pending_frame(self):
+        if self.window.busy or self.pending_frame is None or not self.current:
+            return
+        key,index = self.pending_frame
+        self.pending_frame = None
+        if key == self.current['key']:
+            self.request_frame(index)
+
     def request_frame(self, index):
-        if not self.current or self.window.busy:
+        if not self.current:
             return
         if not 0 <= index < self.current['info'].frame_count:
             return
-        self.panel.setEnabled(False)
+        key = self.current['key']
+        if self.window.busy:
+            self.pending_frame = (key,index)
+            return
+        if self.frame_ready and index == self.index:
+            self.slider.set_frame_value(index)
+            return
+        self.pending_frame = None
         self.frame_ready = False
         self.refresh_brightness()
         path = self.current['info'].path
@@ -213,19 +237,28 @@ class FramePage(QWidget):
                     self.reader.close()
                 self.reader = FrameReader(path)
                 self.reader_path = path
-            return index, to_image(self.reader.read(index))
-        self.window.run_job('读取第 {} 帧…'.format(index), work, self.show_frame, frame_job=True)
+            return key,index, to_image(self.reader.read(index))
+        self.window.run_job('读取第 {} 帧…'.format(index), work, self.show_frame,
+                            frame_job=True, failure=self.frame_failed)
+
+    def frame_failed(self, message):
+        self.pause()
+        self.pending_frame = None
+        self.frame_ready = False
+        self.refresh_brightness()
+        self.slider.set_frame_value(self.index)
 
     def show_frame(self, result):
-        self.index, image = result
+        key,index,image = result
+        if self.current['key'] != key or (self.pending_frame is not None and self.pending_frame != (key,index)):
+            return
+        self.index = index
         self.view.set_image(image)
         self.frame_ready = True
         self.refresh_brightness()
         self.loading = True
         self.selected.setChecked(self.index in self.store.marked(self.current['key']))
-        self.slider.blockSignals(True)
-        self.slider.setValue(self.index)
-        self.slider.blockSignals(False)
+        self.slider.set_frame_value(self.index)
         self.jump.setValue(self.index)
         self.loading = False
         self.store.set_position(self.current['key'], self.index)
@@ -234,10 +267,14 @@ class FramePage(QWidget):
         info = self.current['info']
         self.frame_label.setText('帧 {} / {} · {:.3f} 秒 · {}×{} · M 标记/取消'.format(
             self.index, info.frame_count-1, self.index/info.fps, info.width, info.height))
-        self.update_marks()
 
     def save_mark(self):
-        if self.loading or not self.current or self.window.busy:
+        if self.loading or not self.current:
+            return
+        if not self.frame_ready:
+            self.loading = True
+            self.selected.setChecked(self.index in self.store.marked(self.current['key']))
+            self.loading = False
             return
         self.store.set_mark(self.current['key'], self.index, self.selected.isChecked())
         self.update_marks()
@@ -263,11 +300,15 @@ class FramePage(QWidget):
             count += amount
             self.list.item(i).setText('{}\n已标记 {} 帧'.format(Path(task['info'].path).name, amount))
         self.total.setText('{} 个视频 · 已标记 {} 帧'.format(len(self.tasks), count))
+        previous = self.marks.currentItem()
+        previous_index = previous.data(Qt.UserRole) if previous else None
         self.marks.clear()
         if self.current:
             for index in self.store.marked(self.current['key']):
                 self.marks.addItem('帧 {} · {:.3f} 秒'.format(index, index/self.current['info'].fps))
                 self.marks.item(self.marks.count()-1).setData(Qt.UserRole, index)
+                if index == previous_index:
+                    self.marks.setCurrentRow(self.marks.count()-1)
 
     def locate_mark(self, index):
         self.pause()

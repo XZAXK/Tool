@@ -3,12 +3,14 @@ from pathlib import Path
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QTabWidget, QGroupBox, QFormLayout, QDoubleSpinBox, QComboBox, QLineEdit,
     QFileDialog, QMessageBox, QProgressBar)
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSignal
 from .media import inspect_video, transcode
 from .frame_store import FrameStore
 from .frame_page import FramePage
 from .widgets import button, VIDEOS
 from .workers import Job
+from .clip_preview import ClipPreview
+from . import __version__
 
 
 class ProcessPage(QWidget):
@@ -22,7 +24,20 @@ class ProcessPage(QWidget):
         layout.addWidget(heading)
         description = ('选择一个时间区间，截取并保存为新视频。' if clipping else '选择输出格式，转换并保存为新视频。')
         layout.addWidget(QLabel(description + ' 保留首条音轨（如有）。'))
+        settings_layout = layout
+        if clipping:
+            body = QHBoxLayout()
+            self.preview = ClipPreview(window)
+            body.addWidget(self.preview,1)
+            settings = QWidget()
+            settings.setMinimumWidth(350)
+            settings.setMaximumWidth(430)
+            settings_layout = QVBoxLayout(settings)
+            settings_layout.setContentsMargins(8,0,0,0)
+            body.addWidget(settings)
+            layout.addLayout(body,1)
         group = QGroupBox('处理设置')
+        self.settings_group = group
         form = QFormLayout(group)
         source_row = QHBoxLayout()
         self.source = QLineEdit()
@@ -35,7 +50,7 @@ class ProcessPage(QWidget):
         form.addRow('', self.details)
         self.start, self.end = QDoubleSpinBox(), QDoubleSpinBox()
         for spin in (self.start, self.end):
-            spin.setDecimals(3)
+            spin.setDecimals(6)
             spin.setSuffix(' 秒')
             spin.setRange(0, 999999)
         if clipping:
@@ -51,22 +66,27 @@ class ProcessPage(QWidget):
         button('保存到…', output_row, self.choose_output)
         form.addRow('输出文件', output_row)
         self.format.currentTextChanged.connect(self.reset_output)
-        layout.addWidget(group)
+        settings_layout.addWidget(group)
         actions = QHBoxLayout()
         self.execute = button('开始剪辑' if clipping else '开始转换', actions, self.process)
         self.cancel_button = button('取消处理', actions, self.cancel)
         self.cancel_button.setEnabled(False)
         actions.addStretch()
-        layout.addLayout(actions)
+        settings_layout.addLayout(actions)
         self.progress = QProgressBar()
-        layout.addWidget(self.progress)
+        settings_layout.addWidget(self.progress)
         self.message = QLabel('输出为新文件，原视频保留。')
         self.message.setWordWrap(True)
         self.message.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        layout.addWidget(self.message)
-        layout.addStretch()
+        settings_layout.addWidget(self.message)
+        settings_layout.addStretch()
+        if clipping:
+            self.preview.rangeChanged.connect(self.set_visual_range)
+            self.start.valueChanged.connect(self.update_preview_range)
+            self.end.valueChanged.connect(self.update_preview_range)
 
     def choose_source(self):
+        self.window.pause_playback()
         if self.window.busy:
             return
         path, _ = QFileDialog.getOpenFileName(self, '选择视频', '', VIDEOS)
@@ -77,11 +97,30 @@ class ProcessPage(QWidget):
         self.info = info
         self.source.setText(info.path)
         self.details.setText('{}×{} · {:.3f} 秒 · {:.3f} FPS'.format(info.width, info.height, info.duration, info.fps))
+        self.start.blockSignals(True)
+        self.end.blockSignals(True)
         self.start.setMaximum(info.duration)
         self.end.setMaximum(info.duration)
         self.start.setValue(0)
         self.end.setValue(info.duration)
+        self.start.blockSignals(False)
+        self.end.blockSignals(False)
         self.output.clear()
+        if self.clipping:
+            self.preview.load(info)
+
+    def set_visual_range(self, start, end):
+        self.start.blockSignals(True)
+        self.end.blockSignals(True)
+        self.start.setValue(start)
+        self.end.setValue(end)
+        self.start.blockSignals(False)
+        self.end.blockSignals(False)
+        self.update_preview_range()
+
+    def update_preview_range(self):
+        if self.clipping:
+            self.preview.set_range(self.start.value(),self.end.value())
 
     def reset_output(self):
         self.output.clear()
@@ -99,14 +138,19 @@ class ProcessPage(QWidget):
             return
         if not self.info or not self.output.text():
             return self.window.error('请先选择输入视频和输出文件。')
-        self.window.frames.pause()
+        self.window.pause_playback()
         source, output = self.info.path, self.output.text()
         start = self.start.value() if self.clipping else None
         end = min(self.end.value(), self.info.duration) if self.clipping else None
+        if self.clipping and not 0 <= start < end <= self.info.duration:
+            return self.window.error('起点必须早于终点，且区间不能超出视频时长。')
         self.message.setText('正在处理…')
         self.progress.setValue(0)
         self.cancel_button.setEnabled(True)
         self.execute.setEnabled(False)
+        self.settings_group.setEnabled(False)
+        if self.clipping:
+            self.preview.setEnabled(False)
         def done(path):
             self.message.setText('处理完成：' + path)
             self.progress.setValue(100)
@@ -119,6 +163,9 @@ class ProcessPage(QWidget):
     def finished(self):
         self.cancel_button.setEnabled(False)
         self.execute.setEnabled(True)
+        self.settings_group.setEnabled(True)
+        if self.clipping:
+            self.preview.setEnabled(True)
 
     def cancel(self):
         if self.window.job:
@@ -127,18 +174,19 @@ class ProcessPage(QWidget):
 
 
 class MainWindow(QMainWindow):
+    job_idle = pyqtSignal()
     def __init__(self, root):
         super().__init__()
         self.root = Path(root)
         self.store = FrameStore(self.root / '.demo-data' / 'frames.sqlite3')
         self.job = None
         self.busy = False
-        self.setWindowTitle('帧析 · 视频与图像处理工具 Demo')
+        self.setWindowTitle('帧析 · 视频与图像处理工具 v'+__version__)
         self.resize(1450, 850)
         self.setMinimumSize(1150, 720)
         container = QWidget()
         layout = QVBoxLayout(container)
-        title = QLabel('帧析  /  本地视频工作台')
+        title = QLabel('帧析  /  本地视频工作台  v'+__version__)
         title.setObjectName('heading')
         layout.addWidget(title)
         self.tabs = QTabWidget()
@@ -148,7 +196,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.frames, '帧标记与导出')
         self.tabs.addTab(self.clip, '视频剪辑')
         self.tabs.addTab(self.convert, '格式转换')
-        self.tabs.currentChanged.connect(lambda _: self.frames.pause())
+        self.tabs.currentChanged.connect(self.pause_playback)
         layout.addWidget(self.tabs)
         self.setCentralWidget(container)
         self.statusBar().showMessage('就绪 · 导入视频或载入演示视频开始标记')
@@ -169,12 +217,17 @@ class MainWindow(QMainWindow):
             QTabBar::tab:selected { background: #d8ebf2; color: #173d52; }
         ''')
 
+    def pause_playback(self, *args):
+        self.frames.pause()
+        self.clip.preview.pause()
+
     def run_job(self, message, function, done, frame_job=False, progress=None, cleanup=None, failure=None):
         if self.busy:
             return
         self.busy = True
-        self.frames.list.setEnabled(False)
-        self.statusBar().showMessage(message)
+        if not frame_job:
+            self.frames.list.setEnabled(False)
+            self.statusBar().showMessage(message)
         job = Job(function, self)
         self.job = job
         state = {}
@@ -185,23 +238,25 @@ class MainWindow(QMainWindow):
         def finish():
             self.busy = False
             self.job = None
-            self.frames.list.setEnabled(True)
+            if not frame_job:
+                self.frames.list.setEnabled(True)
             if cleanup:
                 cleanup()
             if 'error' in state:
-                self.frames.pause()
+                self.pause_playback()
                 if failure:
                     failure(state['error'])
-                if frame_job:
-                    self.frames.panel.setEnabled(False)
                 self.error(state['error'])
             else:
-                self.statusBar().showMessage('就绪 · 本地记录自动保存')
+                if not frame_job:
+                    self.statusBar().showMessage('就绪 · 本地记录自动保存')
                 try:
                     done(state.get('result'))
                 except Exception as error:
                     self.error(str(error))
             job.deleteLater()
+            if not self.busy:
+                self.job_idle.emit()
         job.finished.connect(finish)
         job.start()
 
@@ -220,5 +275,6 @@ class MainWindow(QMainWindow):
         self.frames.pause()
         if self.frames.reader:
             self.frames.reader.close()
+        self.clip.preview.close_reader()
         self.store.close()
         event.accept()

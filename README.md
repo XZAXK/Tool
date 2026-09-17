@@ -2,6 +2,8 @@
 
 本地 Python + Qt 客户端，提供**帧标记与导出、视频剪辑、视频格式转换**三个独立页面。
 
+当前版本 **v0.2.0**，更新说明见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 启动
 
 在项目根目录执行 `python main.py`，或双击 `启动Demo.cmd`。当前电脑已验证 `D:\Anaconda3\python.exe` 可运行。
@@ -21,7 +23,7 @@ FFmpeg 查找顺序：`FFMPEG_EXE`、PATH、`imageio-ffmpeg`、`.local/ffmpeg-pa
 ## 帧标记与导出
 
 1. 点击“导入视频”，或“载入演示视频”生成六秒本地示例。
-2. 播放/暂停、上一帧/下一帧，或输入帧编号跳转。帧号从 0 开始。
+2. 播放/暂停、上一帧/下一帧，点击或拖动时间轴，或输入帧编号跳转。时间轴定位会暂停播放，连续拖动以最后位置为准。帧号从 0 开始。
 3. 勾选“标记当前帧用于导出”，也可按 M；取消勾选即可取消标记。
 4. 右侧列出已标记帧，双击定位，可选中条目后取消标记。
 5. 选择 PNG 或 JPG，点击“导出当前视频已标记帧”，只保存明确标记的帧。
@@ -49,13 +51,23 @@ FFmpeg 查找顺序：`FFMPEG_EXE`、PATH、`imageio-ffmpeg`、`.local/ffmpeg-pa
 
 ## 视频剪辑与转换
 
-- 剪辑：截取一个时间区间，起点包含、终点不包含，以秒输入，保存为新视频。
+- 剪辑：提供画面预览、逐帧定位和可视化选区，也可按秒输入起止时间，保存为新视频。
 - 转换：输出 MP4、MKV 或 AVI，每次处理一个视频。
 - MP4/MKV 使用 H.264 + AAC，AVI 使用 MPEG-4 + MP3；保留首条视频流和可选首条音轨。
 - 重新编码，奇数宽高补齐至偶数；不承诺无损转换。
 - 提供进度和取消，临时文件验证成功后才转为目标文件，拒绝覆盖源文件和已有输出。
 - 不套用帧标记页面的三分钟、2K 限制。
 - 暂不支持拼接、多区间删除、批量转换、参数调节、字幕或多音轨保留。
+
+### 可视化剪辑操作
+
+1. 在“视频剪辑”页选择视频，左侧显示预览画面。
+2. 点击或拖动时间轴，配合上一帧/下一帧定位，点击“当前帧设为起点”。
+3. 定位到希望保留的最后一帧，点击“当前帧设为终点（含此帧）”。
+4. 绿色时间轴显示选区；点击“预览选区”检查，或在右侧微调起止秒数。
+5. 选择输出格式及新文件路径，开始剪辑。
+
+时间区间仍为起点包含、终点不包含；画面设置终点会自动使用当前帧之后的时间边界。预览不播放音频，导出仍保留原视频首条音轨（如有）。可变帧率视频的精确时间戳暂未实现。
 
 ## 模块组织
 
@@ -64,8 +76,9 @@ FFmpeg 查找顺序：`FFMPEG_EXE`、PATH、`imageio-ffmpeg`、`.local/ffmpeg-pa
 | `main.py` | 启动入口 |
 | `media_tool/ui.py` | 主窗口、剪辑及转换页面 |
 | `media_tool/frame_page.py` | 帧定位、标记与图片导出交互 |
+| `media_tool/clip_preview.py` | 剪辑画面预览、选区及区间播放 |
 | `media_tool/frame_store.py` | 标记及查看位置持久化 |
-| `media_tool/widgets.py` | 共用视频画面控件 |
+| `media_tool/widgets.py` | 共用视频画面与时间轴控件 |
 | `media_tool/media.py` | 视频信息、解码、FFmpeg 处理 |
 | `media_tool/rendering.py` | 视频帧转 Qt 图片 |
 | `media_tool/exports.py` | 已标记帧图片导出 |
@@ -77,6 +90,8 @@ FFmpeg 查找顺序：`FFMPEG_EXE`、PATH、`imageio-ffmpeg`、`.local/ffmpeg-pa
 执行 `python -m unittest discover -s tests -v`。
 
 覆盖帧顺序准确性、标记/取消与恢复、Qt 导入及 PNG/JPG 导出、覆盖保护、FFmpeg 剪辑/转换/取消与音轨保留。截图输出到 `test-output/frame-marking-demo.png`。
+
+`tests/test_revision.py` 还覆盖时间轴点击和拖动、解码忙碌时保留最后定位、切换视频丢弃旧结果、右栏稳定性，以及可视化选区预览和实际剪辑输出。剪辑页面截图为 `test-output/v0.2.0-visual-clip.png`。
 
 当前需求见 [首版需求方案.md](首版需求方案.md)。
 

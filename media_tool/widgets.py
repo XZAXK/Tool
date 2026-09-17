@@ -1,8 +1,9 @@
 """Shared video widgets and input filters."""
 import math
-from PyQt5.QtCore import Qt, QTimer, QEvent
-from PyQt5.QtGui import QPixmap, QPainter, QImage, QCursor
-from PyQt5.QtWidgets import QPushButton, QGraphicsView, QGraphicsScene, QToolTip
+from PyQt5.QtCore import Qt, QTimer, QEvent, pyqtSignal, QRectF
+from PyQt5.QtGui import QPixmap, QPainter, QImage, QCursor, QColor
+from PyQt5.QtWidgets import (QPushButton, QGraphicsView, QGraphicsScene, QToolTip,
+                            QSlider, QStyle, QStyleOptionSlider)
 
 VIDEOS = '视频 (*.mp4 *.mkv *.avi *.mov *.webm *.m4v);;所有文件 (*)'
 
@@ -12,6 +13,99 @@ def button(text, layout, callback):
     widget.clicked.connect(callback)
     layout.addWidget(widget)
     return widget
+
+
+class TimelineSlider(QSlider):
+    """Absolute mouse seeking, separate from programmatic playback updates."""
+    seekRequested = pyqtSignal(int)
+    scrubStarted = pyqtSignal()
+
+    def __init__(self):
+        super().__init__(Qt.Horizontal)
+        self.setTracking(False)
+        self.selection = None
+
+    def track_geometry(self):
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        groove = self.style().subControlRect(QStyle.CC_Slider, option, QStyle.SC_SliderGroove, self)
+        handle = self.style().subControlRect(QStyle.CC_Slider, option, QStyle.SC_SliderHandle, self)
+        return option, groove, handle
+
+    def value_at(self, position):
+        option, groove, handle = self.track_geometry()
+        span = max(1, groove.width()-handle.width())
+        offset = position.x()-groove.x()-handle.width()//2
+        return QStyle.sliderValueFromPosition(self.minimum(), self.maximum(),
+                                              max(0,min(span,offset)), span, option.upsideDown)
+
+    def request_at(self, position):
+        value = self.value_at(position)
+        self.setValue(value)
+        self.seekRequested.emit(value)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return super().mousePressEvent(event)
+        self.setFocus()
+        self.scrubStarted.emit()
+        self.setSliderDown(True)
+        self.request_at(event.pos())
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self.isSliderDown():
+            self.request_at(event.pos())
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.isSliderDown():
+            self.setSliderDown(False)
+            self.request_at(event.pos())
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        self.scrubStarted.emit()
+        previous = self.value()
+        super().keyPressEvent(event)
+        if self.value() != previous:
+            self.seekRequested.emit(self.value())
+
+    def wheelEvent(self, event):
+        self.scrubStarted.emit()
+        previous = self.value()
+        super().wheelEvent(event)
+        if self.value() != previous:
+            self.seekRequested.emit(self.value())
+
+    def set_frame_value(self, value):
+        if not self.isSliderDown():
+            self.blockSignals(True)
+            self.setValue(value)
+            self.blockSignals(False)
+
+    def set_selection(self, start, end):
+        self.selection = (start, end)
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.selection is None or self.maximum() <= self.minimum():
+            return
+        option, groove, handle = self.track_geometry()
+        span = max(1, groove.width()-handle.width())
+        start,end = self.selection
+        start = max(self.minimum(),min(self.maximum(),start))
+        end = max(self.minimum(),min(self.maximum(),end))
+        x1 = groove.x()+handle.width()/2+span*(start-self.minimum())/(self.maximum()-self.minimum())
+        x2 = groove.x()+handle.width()/2+span*(end-self.minimum())/(self.maximum()-self.minimum())
+        painter = QPainter(self)
+        painter.fillRect(QRectF(x1, groove.center().y()+5, max(2,x2-x1), 4), QColor('#219b88'))
+        painter.end()
 
 
 class ImageView(QGraphicsView):
@@ -41,6 +135,13 @@ class ImageView(QGraphicsView):
         self.hover_timer.stop()
         self.hover_position = None
         QToolTip.hideText()
+
+    def clear_image(self):
+        self.cancel_hover()
+        self.source_image = QImage()
+        self.item.setPixmap(QPixmap())
+        self.scene().setSceneRect(self.item.boundingRect())
+        self.manual = False
 
     def set_brightness_enabled(self, enabled):
         self.cancel_hover()
@@ -98,7 +199,7 @@ class ImageView(QGraphicsView):
         old_size = self.item.pixmap().size()
         self.item.setPixmap(QPixmap.fromImage(image))
         self.scene().setSceneRect(self.item.boundingRect())
-        if not self.manual or old_size != image.size():
+        if old_size != image.size():
             self.fit()
 
     def fit(self):
